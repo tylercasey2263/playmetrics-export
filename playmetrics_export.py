@@ -1,14 +1,24 @@
 """
 PlayMetrics Player Export Script
-Exports players with contact information to CSV
+
+Automatically exports player data with parent/guardian contact information
+from PlayMetrics to CSV format.
+
+Features:
+- Automated browser login with Selenium (headless Chrome)
+- 2FA support with device remembering (only need to verify once)
+- Captures authentication from network traffic
+- Exports players, teams, and programs to timestamped CSV
 
 Usage:
-1. Install dependencies: pip install selenium webdriver-manager python-dotenv
-2. Create a .env file with your credentials (see .env.example)
-   Or set environment variables: PLAYMETRICS_EMAIL, PLAYMETRICS_PASSWORD
-3. Run: python playmetrics_export.py
+    1. Install dependencies: pip install -r requirements.txt
+    2. Create .env file with credentials: copy .env.example .env
+    3. Edit .env with your PlayMetrics email and password
+    4. Run: python playmetrics_export.py
 
-The script will automatically log in via browser and fetch data.
+First run will prompt for 2FA code. Subsequent runs skip 2FA automatically.
+
+Repository: https://github.com/tylercasey2263/playmetrics-export
 """
 
 import csv
