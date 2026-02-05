@@ -1,0 +1,19 @@
+# Environment variables (contains credentials)
+.env
+
+# Cached tokens
+.playmetrics_tokens.json
+
+# Chrome profile (stores session/cookies)
+.chrome_profile/
+
+# Debug screenshots
+login_error_screenshot.png
+error_screenshot.png
+
+# Python
+__pycache__/
+*.pyc
+
+# Exported data (contains personal info)
+*.csv
