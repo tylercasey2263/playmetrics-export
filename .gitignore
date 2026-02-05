@@ -11,6 +11,9 @@
 login_error_screenshot.png
 error_screenshot.png
 
+# Claude Code
+.claude/
+
 # Python
 __pycache__/
 *.pyc
