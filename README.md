@@ -8,7 +8,7 @@ A Python tool to export player, team, program, tournament, and game data from Pl
 - **Command-line 2FA** - Prompts for verification code in the terminal when needed
 - **Persistent auth** - Saves tokens locally so 2FA is only needed once (~90 days)
 - **Automatic token refresh** - Firebase tokens are refreshed automatically on each run
-- **Complete data export** - Players with parent/guardian contacts, teams, programs, tournaments, and games
+- **Selective export** - Export all data or pick specific types with `--players`, `--teams`, `--games`, etc.
 
 ## Requirements
 
@@ -46,8 +46,23 @@ A Python tool to export player, team, program, tournament, and game data from Pl
 ## Usage
 
 ```bash
-python playmetrics_export.py
+python playmetrics_export.py                  # Export all data types (default)
+python playmetrics_export.py --players        # Export only players
+python playmetrics_export.py --teams --games  # Export teams and games
+python playmetrics_export.py -p -t            # Short flags work too
 ```
+
+### Command-Line Flags
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--players` | `-p` | Export players (with parent/guardian contacts) |
+| `--teams` | `-t` | Export teams |
+| `--programs` | `-r` | Export programs |
+| `--tournaments` | `-n` | Export tournaments |
+| `--games` | `-g` | Export games |
+
+If no flags are specified, all data types are exported. Use `--help` for full usage info.
 
 ### First Run
 
@@ -61,6 +76,7 @@ On the first run, the script will:
 ```
 PlayMetrics Data Export
 ========================================
+Exporting: games, players, programs, teams, tournaments
 No saved tokens, doing full sign-in...
 Signing in to Firebase...
   Firebase sign-in successful
@@ -72,11 +88,10 @@ Code sent!
 Enter the 6-digit verification code: 123456
 2FA verified! Access key obtained.
 PlayMetrics API access confirmed!
-Authentication saved for future runs!
 
 Fetching data from PlayMetrics API...
 Fetching players...
-  Got 1891 players
+  Got 1899 players
 Fetching teams...
   Got teams data (212)
 Fetching programs...
@@ -84,9 +99,9 @@ Fetching programs...
 ...
 
 Exporting...
-  Exported 1891 players -> playmetrics_players_20260209_140500.csv
+  Exported 1899 players -> playmetrics_players_20260210_140500.csv
 
-Done!
+Done! Exported 5 file(s).
 ```
 
 ### Subsequent Runs
@@ -96,13 +111,17 @@ After the first run, no 2FA is needed. The script refreshes tokens automatically
 ```
 PlayMetrics Data Export
 ========================================
+Exporting: players
 Refreshing Firebase token...
   Firebase token refreshed
 Authentication successful (saved credentials still valid)
 
 Fetching data from PlayMetrics API...
+Fetching players...
+  Got 1899 players
 ...
-Done!
+
+Done! Exported 1 file(s).
 ```
 
 ### Scheduling / Automation
@@ -110,11 +129,14 @@ Done!
 Since no browser or user interaction is needed after the first run, you can schedule the script with Windows Task Scheduler, cron, or any automation tool:
 
 ```bash
-# Windows Task Scheduler action:
+# Windows Task Scheduler - export everything:
 python C:\path\to\playmetrics_export.py
 
+# Windows Task Scheduler - export only players:
+python C:\path\to\playmetrics_export.py --players
+
 # Linux/Mac cron:
-0 6 * * * python /path/to/playmetrics_export.py
+0 6 * * * python /path/to/playmetrics_export.py --players --teams
 ```
 
 The `verified2fa` token lasts ~90 days. If it expires, the script will prompt for a new 2FA code on the next interactive run.

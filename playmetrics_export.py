@@ -9,12 +9,13 @@ Authentication is handled entirely via Firebase REST API:
 - Subsequent runs: refreshes the saved token automatically (no 2FA needed)
 
 Usage:
-    1. Install dependencies: pip install -r requirements.txt
-    2. Create .env file with credentials: copy .env.example .env
-    3. Edit .env with your PlayMetrics email and password
-    4. Run: python playmetrics_export.py
+    python playmetrics_export.py                  # Export all data types
+    python playmetrics_export.py --players        # Export only players
+    python playmetrics_export.py --teams --games  # Export teams and games
+    python playmetrics_export.py -p -t            # Short flags work too
 """
 
+import argparse
 import csv
 import json
 import os
@@ -465,64 +466,73 @@ def api_get(endpoint, params, auth):
     return resp.json()
 
 
-def fetch_all_data(auth):
-    """Fetch all data via direct API calls."""
+def fetch_data(auth, types):
+    """Fetch requested data types via direct API calls.
+
+    Args:
+        auth: Auth tokens dict.
+        types: Set of data type names to fetch (e.g. {"players", "teams"}).
+    """
     data = {}
 
-    # Players
-    print("Fetching players...")
-    try:
-        data["players"] = api_get("/players", {
-            "data": json.dumps({"include_archived": False}),
-            "populate": "team_players,users,program_ids",
-        }, auth)
-        count = len(data["players"]) if isinstance(data["players"], list) else len(data["players"].get("data", []))
-        print(f"  Got {count} players")
-    except Exception as e:
-        print(f"  Failed: {e}")
+    # Players need teams/programs for lookups, so fetch those if players are requested
+    need_teams = "teams" in types or "players" in types
+    need_programs = "programs" in types or "players" in types
 
-    # Teams
-    print("Fetching teams...")
-    try:
-        data["teams"] = api_get("/teams", {"populate": "num_players"}, auth)
-        count = len(data["teams"]) if isinstance(data["teams"], list) else "?"
-        print(f"  Got teams data ({count})")
-    except Exception as e:
-        print(f"  Failed: {e}")
-
-    # Programs
-    print("Fetching programs...")
-    try:
-        data["programs"] = api_get("/program_admin/programs", {"populate": "prune"}, auth)
-        print(f"  Got programs data")
-    except Exception as e:
-        print(f"  Failed: {e}")
-
-    # Tournaments - try common endpoints
-    print("Fetching tournaments...")
-    for endpoint in ["/tournaments", "/events", "/program_admin/events", "/program_admin/tournaments"]:
+    if "players" in types:
+        print("Fetching players...")
         try:
-            result = api_get(endpoint, {}, auth)
-            data["tournaments"] = result
-            print(f"  Got tournaments (via {endpoint})")
-            break
-        except:
-            pass
-    if "tournaments" not in data:
-        print("  No tournament endpoint found (tried /tournaments, /events, etc.)")
+            data["players"] = api_get("/players", {
+                "data": json.dumps({"include_archived": False}),
+                "populate": "team_players,users,program_ids",
+            }, auth)
+            count = len(data["players"]) if isinstance(data["players"], list) else len(data["players"].get("data", []))
+            print(f"  Got {count} players")
+        except Exception as e:
+            print(f"  Failed: {e}")
 
-    # Games - try common endpoints
-    print("Fetching games...")
-    for endpoint in ["/games", "/matches", "/schedule", "/program_admin/games", "/program_admin/schedule"]:
+    if need_teams:
+        print("Fetching teams...")
         try:
-            result = api_get(endpoint, {}, auth)
-            data["games"] = result
-            print(f"  Got games (via {endpoint})")
-            break
-        except:
-            pass
-    if "games" not in data:
-        print("  No games endpoint found (tried /games, /matches, etc.)")
+            data["teams"] = api_get("/teams", {"populate": "num_players"}, auth)
+            count = len(data["teams"]) if isinstance(data["teams"], list) else "?"
+            print(f"  Got teams data ({count})")
+        except Exception as e:
+            print(f"  Failed: {e}")
+
+    if need_programs:
+        print("Fetching programs...")
+        try:
+            data["programs"] = api_get("/program_admin/programs", {"populate": "prune"}, auth)
+            print(f"  Got programs data")
+        except Exception as e:
+            print(f"  Failed: {e}")
+
+    if "tournaments" in types:
+        print("Fetching tournaments...")
+        for endpoint in ["/tournaments", "/events", "/program_admin/events", "/program_admin/tournaments"]:
+            try:
+                result = api_get(endpoint, {}, auth)
+                data["tournaments"] = result
+                print(f"  Got tournaments (via {endpoint})")
+                break
+            except:
+                pass
+        if "tournaments" not in data:
+            print("  No tournament endpoint found (tried /tournaments, /events, etc.)")
+
+    if "games" in types:
+        print("Fetching games...")
+        for endpoint in ["/games", "/matches", "/schedule", "/program_admin/games", "/program_admin/schedule"]:
+            try:
+                result = api_get(endpoint, {}, auth)
+                data["games"] = result
+                print(f"  Got games (via {endpoint})")
+                break
+            except:
+                pass
+        if "games" not in data:
+            print("  No games endpoint found (tried /games, /matches, etc.)")
 
     return data
 
@@ -703,9 +713,37 @@ def export_generic_csv(data, name):
 # Main
 # =============================================================================
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Export data from PlayMetrics to CSV.",
+        epilog="If no flags are specified, all data types are exported.",
+    )
+    parser.add_argument("-p", "--players", action="store_true", help="Export players")
+    parser.add_argument("-t", "--teams", action="store_true", help="Export teams")
+    parser.add_argument("-r", "--programs", action="store_true", help="Export programs")
+    parser.add_argument("-n", "--tournaments", action="store_true", help="Export tournaments")
+    parser.add_argument("-g", "--games", action="store_true", help="Export games")
+    return parser.parse_args()
+
+
+ALL_TYPES = {"players", "teams", "programs", "tournaments", "games"}
+
+
 def main():
+    args = parse_args()
+
+    # If no specific flags, export everything
+    requested = set()
+    for name in ALL_TYPES:
+        if getattr(args, name, False):
+            requested.add(name)
+    if not requested:
+        requested = ALL_TYPES.copy()
+
     print("PlayMetrics Data Export")
     print("=" * 40)
+    print(f"Exporting: {', '.join(sorted(requested))}")
 
     if not CREDENTIALS["password"]:
         print("\nERROR: Please set your password!")
@@ -720,30 +758,43 @@ def main():
         print("\nAuthentication failed.")
         return
 
-    # Fetch all data via direct API calls
+    # Fetch requested data via direct API calls
     print("\nFetching data from PlayMetrics API...")
-    data = fetch_all_data(auth)
+    data = fetch_data(auth, requested)
 
-    if not data.get("players"):
-        print("\nERROR: Could not fetch player data.")
-        print(f"Try deleting auth file to force re-login: del \"{AUTH_FILE}\"")
-        return
-
-    # Build lookups
+    # Build lookups (needed for player export)
     team_lookup = build_team_lookup(data.get("teams"))
     program_lookup = build_program_lookup(data.get("programs"))
-    print(f"\n{len(team_lookup)} teams, {len(program_lookup)} programs")
 
     # Export
     print("\nExporting...")
-    export_players_csv(data["players"], team_lookup, program_lookup)
+    exported = 0
 
-    if data.get("tournaments"):
+    if "players" in requested and data.get("players"):
+        export_players_csv(data["players"], team_lookup, program_lookup)
+        exported += 1
+
+    if "teams" in requested and data.get("teams"):
+        export_generic_csv(data["teams"], "teams")
+        exported += 1
+
+    if "programs" in requested and data.get("programs"):
+        export_generic_csv(data["programs"], "programs")
+        exported += 1
+
+    if "tournaments" in requested and data.get("tournaments"):
         export_generic_csv(data["tournaments"], "tournaments")
-    if data.get("games"):
-        export_generic_csv(data["games"], "games")
+        exported += 1
 
-    print("\nDone!")
+    if "games" in requested and data.get("games"):
+        export_generic_csv(data["games"], "games")
+        exported += 1
+
+    if exported == 0:
+        print("  No data to export.")
+        print(f"  Try deleting auth file to force re-login: del \"{AUTH_FILE}\"")
+    else:
+        print(f"\nDone! Exported {exported} file(s).")
 
 
 if __name__ == "__main__":
