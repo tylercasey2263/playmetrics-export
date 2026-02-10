@@ -1,15 +1,15 @@
 # Environment variables (contains credentials)
 .env
 
-# Cached tokens
+# Auth tokens (contains access keys - stored in %LOCALAPPDATA%)
+playmetrics_auth.json
 .playmetrics_tokens.json
 
-# Chrome profile (stores session/cookies)
+# Chrome profile (legacy - no longer used)
 .chrome_profile/
 
 # Debug screenshots
-login_error_screenshot.png
-error_screenshot.png
+*_screenshot.png
 
 # ClaudeCode
 .claude/

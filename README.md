@@ -1,19 +1,18 @@
-# PlayMetrics Player Export
+# PlayMetrics Data Export
 
-A Python tool to automatically export player data with parent/guardian contact information from PlayMetrics to CSV.
+A Python tool to export player, team, program, tournament, and game data from PlayMetrics to CSV. Uses direct API calls with no browser required.
 
 ## Features
 
-- **Automated browser login** - Uses Selenium to handle the login flow automatically
-- **2FA support** - Prompts for verification code when required
-- **Device remembering** - Persistent Chrome profile saves "Remember this device" so you only need 2FA once
-- **Network traffic capture** - Extracts authentication tokens from the app's own API calls
-- **Complete data export** - Fetches players, teams, and programs with all contact details
+- **No browser needed** - Authenticates entirely via REST API (Firebase + PlayMetrics backend)
+- **Command-line 2FA** - Prompts for verification code in the terminal when needed
+- **Persistent auth** - Saves tokens locally so 2FA is only needed once (~90 days)
+- **Automatic token refresh** - Firebase tokens are refreshed automatically on each run
+- **Complete data export** - Players with parent/guardian contacts, teams, programs, tournaments, and games
 
 ## Requirements
 
 - Python 3.8 or higher
-- Google Chrome browser installed
 - A PlayMetrics account with admin access
 
 ## Installation
@@ -52,78 +51,145 @@ python playmetrics_export.py
 
 ### First Run
 
-On your first run, the script will:
-1. Open a headless Chrome browser
-2. Navigate to PlayMetrics and log in with your credentials
-3. Prompt you for a 2FA verification code (sent to your phone)
-4. Check "Remember this device" automatically
-5. Fetch all player data and export to CSV
+On the first run, the script will:
+1. Sign in to Firebase with your email/password
+2. Authenticate with the PlayMetrics backend
+3. Send a 2FA code to your phone and prompt you to enter it
+4. Save auth tokens locally (valid for ~90 days)
+5. Fetch all data and export to CSV
+
+```
+PlayMetrics Data Export
+========================================
+No saved tokens, doing full sign-in...
+Signing in to Firebase...
+  Firebase sign-in successful
+Logging in to PlayMetrics backend...
+
+PlayMetrics 2FA verification required!
+Sending verification code to your phone...
+Code sent!
+Enter the 6-digit verification code: 123456
+2FA verified! Access key obtained.
+PlayMetrics API access confirmed!
+Authentication saved for future runs!
+
+Fetching data from PlayMetrics API...
+Fetching players...
+  Got 1891 players
+Fetching teams...
+  Got teams data (212)
+Fetching programs...
+  Got programs data
+...
+
+Exporting...
+  Exported 1891 players -> playmetrics_players_20260209_140500.csv
+
+Done!
+```
 
 ### Subsequent Runs
 
-After the first successful login, future runs will:
-1. Skip 2FA (device is remembered)
-2. Automatically capture authentication from the app
-3. Export data directly
-
-### Example Output
+After the first run, no 2FA is needed. The script refreshes tokens automatically:
 
 ```
-PlayMetrics Player Export
+PlayMetrics Data Export
 ========================================
+Refreshing Firebase token...
+  Firebase token refreshed
+Authentication successful (saved credentials still valid)
 
-Launching browser...
-Navigating to PlayMetrics...
-Already logged in! (session restored)
-
-Fetching data from PlayMetrics...
-Loading PlayMetrics players page...
-  Extracting auth headers from network traffic...
-  Got headers: ['firebase-token', 'pm-access-key', 'build-version']
-Fetching players...
-    Got players data (1891 records)
-Fetching teams...
-    Got teams data
-Fetching programs...
-    Got programs data
-Found 212 teams
-Found 35 programs
-
-Exported 1891 players to playmetrics_players_20260204_204639.csv
+Fetching data from PlayMetrics API...
+...
+Done!
 ```
 
-## Output Format
+### Scheduling / Automation
 
-The exported CSV includes the following columns:
+Since no browser or user interaction is needed after the first run, you can schedule the script with Windows Task Scheduler, cron, or any automation tool:
+
+```bash
+# Windows Task Scheduler action:
+python C:\path\to\playmetrics_export.py
+
+# Linux/Mac cron:
+0 6 * * * python /path/to/playmetrics_export.py
+```
+
+The `verified2fa` token lasts ~90 days. If it expires, the script will prompt for a new 2FA code on the next interactive run.
+
+## Output
+
+### Players CSV
+
+The main export includes player details and up to 4 parent/guardian contacts:
 
 | Column | Description |
 |--------|-------------|
 | Player ID | Unique player identifier |
-| Player First Name | Player's first name |
-| Player Last Name | Player's last name |
+| First Name | Player's first name |
+| Last Name | Player's last name |
 | Birth Date | Player's date of birth |
 | Gender | Player's gender |
+| Teams | Assigned teams (semicolon-separated) |
 | Program(s) | Enrolled programs (semicolon-separated) |
-| Parent 1 Name | Primary contact name |
-| Parent 1 Email | Primary contact email |
-| Parent 2 Name | Secondary contact name |
-| Parent 2 Email | Secondary contact email |
-| Parent 3 Name | Third contact name |
-| Parent 3 Email | Third contact email |
-| Parent 4 Name | Fourth contact name |
-| Parent 4 Email | Fourth contact email |
+| Parent 1-4 Name | Contact name |
+| Parent 1-4 Email | Contact email |
+| Parent 1-4 Phone | Contact phone number |
+
+### Tournaments & Games CSV
+
+If tournament and game endpoints are available, they are exported as separate CSV files with all fields from the API response.
+
+## How It Works
+
+### Authentication Flow
+
+The script uses a two-layer authentication system, both handled via REST API:
+
+```
+1. Firebase Auth (email/password)
+   POST identitytoolkit.googleapis.com/v1/accounts:signInWithPassword
+   -> Returns Firebase ID token + refresh token
+
+2. PlayMetrics Backend Auth (2FA + access key)
+   POST api.playmetrics.com/firebase/user/login
+   -> If needs_2fa: true
+      POST /firebase/user/2fa/send_code  (sends SMS)
+      POST /firebase/user/2fa/validate   (returns access_key + verified2fa)
+   -> If needs_2fa: false (verified2fa cookie valid)
+      Returns access_key directly
+
+3. API Calls
+   GET api.playmetrics.com/players
+   Headers: firebase-token, pm-access-key, build-version
+```
+
+### Token Persistence
+
+Auth tokens are saved to `%LOCALAPPDATA%\playmetrics_auth.json`:
+
+| Token | Purpose | Lifetime |
+|-------|---------|----------|
+| `refresh_token` | Refreshes Firebase ID tokens | Long-lived (months) |
+| `firebase_token` | Authenticates with Firebase | 1 hour (auto-refreshed) |
+| `pm_access_key` | Authenticates API requests | Per-session |
+| `verified2fa` | Skips 2FA on next login | ~90 days |
+
+On each run, the Firebase token is refreshed automatically. If the `verified2fa` token is still valid, no 2FA prompt is needed.
 
 ## File Structure
 
 ```
 playmetrics-export/
-├── playmetrics_export.py   # Main export script
-├── requirements.txt        # Python dependencies
-├── .env.example           # Credential template
-├── .env                   # Your credentials (not committed)
-├── .gitignore            # Git ignore rules
-├── .chrome_profile/      # Persistent browser data (not committed)
-└── README.md             # This file
+├── playmetrics_export.py       # Main export script
+├── requirements.txt            # Python dependencies
+├── .env.example                # Credential template
+├── .env                        # Your credentials (not committed)
+├── .gitignore                  # Git ignore rules
+├── README.md                   # This file
+└── playmetrics_players_*.csv   # Exported data (not committed)
 ```
 
 ## Troubleshooting
@@ -133,44 +199,40 @@ playmetrics-export/
 pip install -r requirements.txt
 ```
 
-### Login fails or times out
+### Login fails with "INVALID_LOGIN_CREDENTIALS"
 - Verify your email and password in `.env`
-- Check that PlayMetrics is accessible in your browser
-- Look at `error_screenshot.png` if generated
+- Make sure your PlayMetrics account is active
 
-### 2FA required every time
-- Delete the `.chrome_profile` folder and run again
-- Make sure to check "Remember this device" when prompted
+### 2FA code not arriving
+- Check your phone for SMS from PlayMetrics
+- Wait a minute and try running the script again
 
-### "Could not extract headers" error
-- The app may have updated its authentication method
-- Try deleting `.chrome_profile` and logging in fresh
-- Check if PlayMetrics works normally in your browser
+### "Invalid access_key" error
+The saved access key has expired. Delete the auth file and re-authenticate:
+```bash
+# Windows
+del "%LOCALAPPDATA%\playmetrics_auth.json"
+
+# Then run again - it will prompt for 2FA
+python playmetrics_export.py
+```
 
 ### Reset everything
 To start completely fresh:
 ```bash
 # Windows
-rmdir /s /q .chrome_profile
+del "%LOCALAPPDATA%\playmetrics_auth.json"
 
 # Mac/Linux
-rm -rf .chrome_profile
+rm ~/.local/playmetrics_auth.json
 ```
-
-## How It Works
-
-1. **Browser Automation**: Uses Selenium with a headless Chrome browser to navigate PlayMetrics
-2. **Session Persistence**: Stores Chrome profile data locally so the "Remember this device" setting persists
-3. **Network Interception**: Captures the authentication headers (Firebase token + PM access key) from Chrome's performance logs
-4. **API Calls**: Uses the captured headers to make authenticated API requests for player data
-5. **Data Processing**: Combines player, team, and program data into a single CSV export
 
 ## Security Notes
 
-- Your password is stored in `.env` which is excluded from git
-- The Chrome profile in `.chrome_profile/` contains session cookies - keep it private
-- Exported CSV files contain personal information - handle appropriately
-- Never commit `.env`, `.chrome_profile/`, or `*.csv` files to version control
+- Your password is stored in `.env` which is excluded from git via `.gitignore`
+- Auth tokens in `playmetrics_auth.json` grant access to your account - keep the file private
+- Exported CSV files contain personal information (names, emails, phone numbers) - handle appropriately
+- Never commit `.env`, `playmetrics_auth.json`, or `*.csv` files to version control
 
 ## License
 

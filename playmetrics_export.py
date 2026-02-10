@@ -1,30 +1,26 @@
 """
-PlayMetrics Player Export Script
+PlayMetrics Data Export Script
 
-Automatically exports player data with parent/guardian contact information
-from PlayMetrics to CSV format.
+Exports player, team, program, tournament, and game data from PlayMetrics
+to CSV format using direct API calls. No browser required.
 
-Features:
-- Automated browser login with Selenium (headless Chrome)
-- 2FA support with device remembering (only need to verify once)
-- Captures authentication from network traffic
-- Exports players, teams, and programs to timestamped CSV
+Authentication is handled entirely via Firebase REST API:
+- First run: signs in with email/password, prompts for 2FA code on the command line
+- Subsequent runs: refreshes the saved token automatically (no 2FA needed)
 
 Usage:
     1. Install dependencies: pip install -r requirements.txt
     2. Create .env file with credentials: copy .env.example .env
     3. Edit .env with your PlayMetrics email and password
     4. Run: python playmetrics_export.py
-
-First run will prompt for 2FA code. Subsequent runs skip 2FA automatically.
-
-Repository: https://github.com/tylercasey2263/playmetrics-export
 """
 
 import csv
 import json
 import os
+import sys
 import time
+import requests as http_client
 from datetime import datetime
 from pathlib import Path
 
@@ -33,7 +29,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv not installed, will use os.environ directly
+    pass
 
 # =============================================================================
 # CONFIGURATION
@@ -46,449 +42,487 @@ CREDENTIALS = {
 
 SCRIPT_DIR = Path(__file__).parent
 
+# Auth tokens persisted across runs
+AUTH_FILE = Path(os.environ.get("LOCALAPPDATA", str(SCRIPT_DIR))) / "playmetrics_auth.json"
+
+# Firebase config (public client-side values from playmetrics.com)
+FIREBASE_API_KEY = "AIzaSyBEB_rFRGuLJja2vzeDCa7J1NZp0E7RN4U"
+BUILD_VERSION = "5fac58cc34a04c5db38ff207d38d42409231c684"
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+
 # =============================================================================
-# Browser-based Data Fetcher
+# Firebase REST API Authentication (no browser needed)
 # =============================================================================
 
-def create_driver():
-    """Create a Selenium WebDriver with network logging and persistent profile"""
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.chrome.options import Options
-    from webdriver_manager.chrome import ChromeDriverManager
-
-    options = Options()
-    options.add_argument('--headless=new')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--window-size=1920,1080')
-
-    # Use a persistent Chrome profile to save cookies/"remember device" state
-    profile_dir = SCRIPT_DIR / ".chrome_profile"
-    profile_dir.mkdir(exist_ok=True)
-    options.add_argument(f'--user-data-dir={profile_dir}')
-
-    # Enable performance logging to capture network traffic
-    options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
-
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
+def firebase_sign_in(email, password):
+    """Sign in with email/password via Firebase REST API."""
+    resp = http_client.post(
+        f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}",
+        json={
+            "email": email,
+            "password": password,
+            "returnSecureToken": True,
+        },
+        headers={"User-Agent": USER_AGENT},
+        timeout=15,
     )
-
-    # Enable CDP network tracking
-    driver.execute_cdp_cmd('Network.enable', {})
-
-    return driver
+    return resp.status_code, resp.json()
 
 
-def login_to_playmetrics(driver):
-    """Log into PlayMetrics, handling 2FA if needed"""
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-
-    print("Navigating to PlayMetrics...")
-    driver.get("https://playmetrics.com/login")
-    time.sleep(3)
-
-    # Check if already logged in (redirected away from login page)
-    if "/login" not in driver.current_url:
-        print("Already logged in! (session restored)")
-        return
-
-    # Wait for login form
-    try:
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], input[name='email'], input[placeholder*='mail']"))
-        )
-    except:
-        # Might already be logged in
-        if "/login" not in driver.current_url:
-            print("Already logged in!")
-            return
-        raise
-
-    time.sleep(1)
-
-    # Fill login form
-    print("Entering credentials...")
-    email_field = driver.find_element(By.CSS_SELECTOR, "input[type='email'], input[name='email'], input[placeholder*='mail']")
-    email_field.clear()
-    email_field.send_keys(CREDENTIALS["email"])
-
-    password_field = driver.find_element(By.CSS_SELECTOR, "input[type='password']")
-    password_field.clear()
-    password_field.send_keys(CREDENTIALS["password"])
-
-    # Click login button
-    try:
-        login_button = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-    except:
-        login_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Log') or contains(text(), 'Sign')]")
-    login_button.click()
-
-    print("Logging in...")
-
-    # Wait for page to change
-    WebDriverWait(driver, 30).until(
-        lambda d: "/login" not in d.current_url or "verification" in d.page_source.lower()
+def firebase_mfa_start(mfa_pending_credential, mfa_enrollment_id):
+    """Request SMS verification code for MFA."""
+    resp = http_client.post(
+        f"https://identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:start?key={FIREBASE_API_KEY}",
+        json={
+            "mfaPendingCredential": mfa_pending_credential,
+            "mfaEnrollmentId": mfa_enrollment_id,
+            "phoneSignInInfo": {},
+        },
+        headers={"User-Agent": USER_AGENT},
+        timeout=15,
     )
-    time.sleep(2)
+    return resp.status_code, resp.json()
 
-    # Check if 2FA is required
-    page_source = driver.page_source.lower()
-    if "verification code" in page_source or "enter code" in page_source:
-        print("\n2FA verification required!")
-        verification_code = input("Enter the 6-digit verification code sent to your phone: ").strip()
 
-        code_input = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text'], input[type='number'], input[placeholder*='ode']"))
-        )
-        code_input.clear()
-        code_input.send_keys(verification_code)
+def firebase_mfa_finalize(mfa_pending_credential, session_info, code):
+    """Submit the 2FA code and get final auth tokens."""
+    resp = http_client.post(
+        f"https://identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:finalize?key={FIREBASE_API_KEY}",
+        json={
+            "mfaPendingCredential": mfa_pending_credential,
+            "phoneVerificationInfo": {
+                "sessionInfo": session_info,
+                "code": code,
+            },
+        },
+        headers={"User-Agent": USER_AGENT},
+        timeout=15,
+    )
+    return resp.status_code, resp.json()
 
-        # Check "Remember this device" if available
+
+def firebase_refresh_token(refresh_token):
+    """Get a new ID token using a refresh token."""
+    resp = http_client.post(
+        f"https://securetoken.googleapis.com/v1/token?key={FIREBASE_API_KEY}",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+        headers={"User-Agent": USER_AGENT},
+        timeout=15,
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        return data.get("id_token"), data.get("refresh_token")
+    return None, None
+
+
+# =============================================================================
+# PlayMetrics Backend Auth (separate from Firebase — returns access_key)
+# =============================================================================
+
+def pm_login(firebase_token, verified2fa=""):
+    """Login to PlayMetrics backend. Returns user data including access_key
+    if verified2fa is valid, or needs_2fa=true if 2FA is required."""
+    resp = http_client.post(
+        "https://api.playmetrics.com/firebase/user/login",
+        json={
+            "current_role_id": "",
+            "verified2fa": verified2fa,
+        },
+        headers={
+            "firebase-token": firebase_token,
+            "build-version": BUILD_VERSION,
+            "Origin": "https://playmetrics.com",
+            "Referer": "https://playmetrics.com/",
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        timeout=15,
+    )
+    return resp.status_code, resp.json()
+
+
+def pm_2fa_send_code(firebase_token):
+    """Request PlayMetrics to send a 2FA verification code via SMS."""
+    resp = http_client.post(
+        "https://api.playmetrics.com/firebase/user/2fa/send_code",
+        json={},
+        headers={
+            "firebase-token": firebase_token,
+            "build-version": BUILD_VERSION,
+            "Origin": "https://playmetrics.com",
+            "Referer": "https://playmetrics.com/",
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        timeout=15,
+    )
+    return resp.status_code, resp.json()
+
+
+def pm_2fa_validate(firebase_token, token, code, remember_device=True):
+    """Validate the 2FA code. Returns access_key and verified2fa token."""
+    resp = http_client.post(
+        "https://api.playmetrics.com/firebase/user/2fa/validate",
+        json={
+            "token": token,
+            "validation_code": code,
+            "remember_device": remember_device,
+        },
+        headers={
+            "firebase-token": firebase_token,
+            "build-version": BUILD_VERSION,
+            "Origin": "https://playmetrics.com",
+            "Referer": "https://playmetrics.com/",
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        timeout=15,
+    )
+    return resp.status_code, resp.json()
+
+
+# =============================================================================
+# Auth Token Management
+# =============================================================================
+
+def load_auth():
+    """Load saved auth tokens from disk."""
+    if AUTH_FILE.exists():
         try:
-            remember_checkbox = driver.find_element(By.CSS_SELECTOR, "input[type='checkbox']")
-            if not remember_checkbox.is_selected():
-                remember_checkbox.click()
-        except:
-            pass
-
-        # Click verify button
-        try:
-            verify_button = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-        except:
-            verify_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Verify')]")
-        verify_button.click()
-
-        # Wait for verification to complete
-        WebDriverWait(driver, 30).until(
-            lambda d: "verification" not in d.current_url.lower()
-        )
-        time.sleep(2)
-
-    print("Login successful!")
+            return json.loads(AUTH_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
 
 
-def fetch_api_data(driver, endpoint, params=None):
-    """Fetch data from PlayMetrics API using the browser's authenticated session"""
+def save_auth(auth):
+    """Save auth tokens to disk for future runs."""
+    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTH_FILE.write_text(json.dumps(auth, indent=2))
 
-    # Build the URL with params
-    url = f"https://api.playmetrics.com{endpoint}"
-    if params:
-        from urllib.parse import urlencode
-        url += "?" + urlencode(params)
 
-    # Use fetch() from within the page context - it will use the app's auth headers
-    js_code = f"""
-    return new Promise(async (resolve, reject) => {{
-        try {{
-            // Get the auth headers that the app uses
-            // Look for them in the app's HTTP client or stored state
-            let headers = {{}};
-
-            // Try to find Firebase token in IndexedDB
-            const getFirebaseToken = () => {{
-                return new Promise((res) => {{
-                    const request = indexedDB.open('firebaseLocalStorageDb');
-                    request.onsuccess = (event) => {{
-                        const db = event.target.result;
-                        try {{
-                            const tx = db.transaction('firebaseLocalStorage', 'readonly');
-                            const store = tx.objectStore('firebaseLocalStorage');
-                            const getAll = store.getAll();
-                            getAll.onsuccess = () => {{
-                                for (const item of getAll.result || []) {{
-                                    if (item.value && item.value.stsTokenManager) {{
-                                        res(item.value.stsTokenManager.accessToken);
-                                        return;
-                                    }}
-                                }}
-                                res(null);
-                            }};
-                            getAll.onerror = () => res(null);
-                        }} catch(e) {{
-                            res(null);
-                        }}
-                    }};
-                    request.onerror = () => res(null);
-                    setTimeout(() => res(null), 2000);
-                }});
-            }};
-
-            const firebaseToken = await getFirebaseToken();
-            if (!firebaseToken) {{
-                reject('Could not get Firebase token');
-                return;
-            }}
-
-            headers['firebase-token'] = firebaseToken;
-            headers['Content-Type'] = 'application/json';
-            headers['Accept'] = 'application/json';
-
-            // Make the request
-            const response = await fetch('{url}', {{
-                method: 'GET',
-                headers: headers,
-                credentials: 'include'
-            }});
-
-            if (!response.ok) {{
-                const text = await response.text();
-                reject(`HTTP ${{response.status}}: ${{text}}`);
-                return;
-            }}
-
-            const data = await response.json();
-            resolve(JSON.stringify(data));
-        }} catch (err) {{
-            reject(err.toString());
-        }}
-    }});
+def get_valid_auth():
+    """Get valid auth. Flow:
+    1. Refresh Firebase token (if saved)
+    2. Login to PlayMetrics backend with verified2fa cookie
+    3. If 2FA needed, prompt on command line
+    4. Save access_key + verified2fa for future runs
     """
+    auth = load_auth()
 
-    try:
-        result = driver.execute_script(js_code)
-        return json.loads(result)
-    except Exception as e:
-        error_msg = str(e)
-        if "access_key" in error_msg.lower():
-            # The API needs pm-access-key header - we need to intercept how the app gets it
-            print("  API requires access_key - trying alternative method...")
-            return fetch_via_app_navigation(driver, endpoint)
-        raise
-
-
-def fetch_via_app_navigation(driver, endpoint):
-    """Fetch data by navigating to the page and extracting from app state"""
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-
-    # Map endpoints to pages
-    page_map = {
-        "/players": "https://playmetrics.com/players",
-        "/teams": "https://playmetrics.com/teams",
-        "/program_admin/programs": "https://playmetrics.com/programs",
-    }
-
-    page_url = page_map.get(endpoint)
-    if not page_url:
-        raise ValueError(f"Unknown endpoint: {endpoint}")
-
-    # Set up to capture API responses
-    driver.execute_script("""
-        window._apiResponses = {};
-        const originalFetch = window.fetch;
-        window.fetch = async function(url, options) {
-            const response = await originalFetch.apply(this, arguments);
-            if (url && url.includes && url.includes('api.playmetrics.com')) {
-                try {
-                    const clone = response.clone();
-                    const data = await clone.json();
-                    const endpoint = new URL(url).pathname;
-                    window._apiResponses[endpoint] = data;
-                } catch(e) {}
-            }
-            return response;
-        };
-    """)
-
-    # Navigate to the page
-    driver.get(page_url)
-    time.sleep(5)  # Wait for API calls to complete
-
-    # Get captured responses
-    responses = driver.execute_script("return window._apiResponses;")
-
-    # Find matching response
-    for key, value in responses.items():
-        if endpoint in key or key in endpoint:
-            return value
-
-    # If no direct match, return all responses for debugging
-    if responses:
-        return list(responses.values())[0]
-
-    raise RuntimeError(f"Could not fetch data for {endpoint}")
-
-
-def extract_headers_from_performance_log(driver):
-    """Extract API request headers from Chrome's performance log"""
-    headers = {}
-    logs = driver.get_log('performance')
-
-    api_requests_found = []
-
-    for log in logs:
-        try:
-            message = json.loads(log['message'])['message']
-            method = message.get('method', '')
-
-            # Look for Network.requestWillBeSent events with our API
-            if method == 'Network.requestWillBeSent':
-                request = message['params'].get('request', {})
-                url = request.get('url', '')
-
-                if 'api.playmetrics.com' in url:
-                    api_requests_found.append(url[:80])
-                    req_headers = request.get('headers', {})
-
-                    # Debug: print all header names for first API request
-                    if len(api_requests_found) == 1:
-                        print(f"    Headers in request: {list(req_headers.keys())}")
-
-                    # Get the auth headers (check case-insensitive)
-                    for key, value in req_headers.items():
-                        key_lower = key.lower()
-                        if key_lower in ['firebase-token', 'pm-access-key', 'build-version']:
-                            headers[key_lower] = value
-
-        except (json.JSONDecodeError, KeyError) as e:
-            pass
-
-    if api_requests_found:
-        print(f"    Found {len(api_requests_found)} API requests in log")
-    else:
-        print(f"    No API requests found in {len(logs)} log entries")
-
-    # Return with normalized keys
-    result = {}
-    if headers.get('firebase-token'):
-        result['firebase-token'] = headers['firebase-token']
-    if headers.get('pm-access-key'):
-        result['pm-access-key'] = headers['pm-access-key']
-    if headers.get('build-version'):
-        result['build-version'] = headers['build-version']
-
-    return result if result.get('firebase-token') else None
-
-
-def make_api_call_with_headers(driver, endpoint, params, headers):
-    """Make an API call using captured headers"""
-    from urllib.parse import urlencode
-
-    url = f"https://api.playmetrics.com{endpoint}"
-    if params:
-        url += "?" + urlencode(params)
-
-    headers_json = json.dumps(headers)
-
-    js_code = f"""
-    return (async () => {{
-        try {{
-            const resp = await fetch('{url}', {{
-                method: 'GET',
-                headers: {headers_json},
-                credentials: 'include'
-            }});
-
-            if (!resp.ok) {{
-                const text = await resp.text();
-                return JSON.stringify({{error: resp.status, message: text}});
-            }}
-
-            return await resp.text();
-        }} catch (err) {{
-            return JSON.stringify({{error: err.toString()}});
-        }}
-    }})();
-    """
-
-    result = driver.execute_script(js_code)
-    return json.loads(result) if result else None
-
-
-def fetch_all_data_via_browser(driver):
-    """Fetch all required data by intercepting the app's API calls"""
-    data = {
-        "players": None,
-        "teams": None,
-        "programs": None
-    }
-
-    # Clear performance logs
-    driver.get_log('performance')
-
-    # Navigate to players page - this will trigger API calls
-    print("Loading PlayMetrics players page...")
-    driver.get("https://playmetrics.com/players")
-    time.sleep(6)
-
-    # Extract headers from the network requests that just happened
-    print("  Extracting auth headers from network traffic...")
-    headers = extract_headers_from_performance_log(driver)
-
-    if headers:
-        print(f"  Got headers: {list(headers.keys())}")
-
-        # Add standard headers
-        headers['Accept'] = 'application/json'
-        headers['Content-Type'] = 'application/json'
-
-        # Now make API calls with the captured headers
-        print("Fetching players...")
-        players_result = make_api_call_with_headers(
-            driver,
-            "/players",
-            {"data": json.dumps({"include_archived": False}), "populate": "team_players,users,program_ids"},
-            headers
-        )
-
-        if players_result and 'error' not in players_result:
-            data['players'] = players_result
-            count = len(players_result) if isinstance(players_result, list) else len(players_result.get('data', []))
-            print(f"    Got players data ({count} records)")
+    # Step 1: Get a fresh Firebase token
+    if auth and auth.get("refresh_token"):
+        print("Refreshing Firebase token...")
+        new_id_token, new_refresh_token = firebase_refresh_token(auth["refresh_token"])
+        if new_id_token:
+            auth["firebase_token"] = new_id_token
+            auth["refresh_token"] = new_refresh_token
+            print("  Firebase token refreshed")
         else:
-            print(f"    Players API failed: {players_result}")
-
-        print("Fetching teams...")
-        teams_result = make_api_call_with_headers(
-            driver,
-            "/teams",
-            {"populate": "num_players"},
-            headers
-        )
-        if teams_result and 'error' not in teams_result:
-            data['teams'] = teams_result
-            print(f"    Got teams data")
-
-        print("Fetching programs...")
-        programs_result = make_api_call_with_headers(
-            driver,
-            "/program_admin/programs",
-            {"populate": "prune"},
-            headers
-        )
-        if programs_result and 'error' not in programs_result:
-            data['programs'] = programs_result
-            print(f"    Got programs data")
-
+            print("  Refresh failed, doing full Firebase sign-in...")
+            auth = _firebase_login()
+            if not auth:
+                return None
     else:
-        print("  Could not extract headers from network traffic")
-        print("  Trying to capture data from page directly...")
+        print("No saved tokens, doing full sign-in...")
+        auth = _firebase_login()
+        if not auth:
+            return None
 
-        # Alternative: intercept responses from network log
-        logs = driver.get_log('performance')
-        for log in logs:
-            try:
-                message = json.loads(log['message'])['message']
-                if message['method'] == 'Network.responseReceived':
-                    url = message['params']['response']['url']
-                    if 'api.playmetrics.com/players' in url:
-                        request_id = message['params']['requestId']
-                        try:
-                            body = driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': request_id})
-                            if body and body.get('body'):
-                                data['players'] = json.loads(body['body'])
-                                print(f"    Got players data from network capture")
-                        except:
-                            pass
-            except:
-                pass
+    # Step 2: If we already have a valid access_key, test it
+    if auth.get("pm_access_key"):
+        if test_api(auth):
+            save_auth(auth)
+            print("Authentication successful (saved credentials still valid)")
+            return auth
+        print("  Saved access_key expired, re-authenticating with PlayMetrics...")
+
+    # Step 3: Login to PlayMetrics backend
+    auth = _pm_authenticate(auth)
+    if not auth:
+        return None
+
+    save_auth(auth)
+    return auth
+
+
+def _firebase_login():
+    """Do a fresh Firebase email/password sign-in. Handles Firebase MFA if needed."""
+    print("Signing in to Firebase...")
+    status, result = firebase_sign_in(CREDENTIALS["email"], CREDENTIALS["password"])
+
+    if "mfaPendingCredential" in result:
+        return _handle_firebase_mfa(result)
+    elif "idToken" in result and result.get("idToken"):
+        print("  Firebase sign-in successful")
+        return {
+            "firebase_token": result["idToken"],
+            "refresh_token": result["refreshToken"],
+            "captured_at": datetime.now().isoformat(),
+        }
+    elif result.get("error"):
+        msg = result["error"].get("message", "Unknown error")
+        if "MFA" in msg.upper() or "SECOND_FACTOR" in msg.upper():
+            for detail in result["error"].get("errors", []):
+                if "mfaPendingCredential" in str(detail):
+                    return _handle_firebase_mfa(detail)
+            print(f"Firebase MFA required but unexpected format: {msg}")
+        else:
+            print(f"Firebase login failed: {msg}")
+            if "INVALID" in msg:
+                print("Check your email and password in the .env file.")
+        return None
+    else:
+        print(f"Unexpected Firebase response: {json.dumps(result, indent=2)}")
+        return None
+
+
+def _handle_firebase_mfa(result):
+    """Handle Firebase-level MFA (if enabled)."""
+    mfa_pending = result["mfaPendingCredential"]
+    mfa_info = result.get("mfaInfo", [])
+    if not mfa_info:
+        print("Firebase MFA required but no MFA info returned")
+        return None
+
+    mfa = mfa_info[0]
+    phone = mfa.get("phoneInfo", mfa.get("unobfuscatedPhoneInfo", "your phone"))
+    enrollment_id = mfa.get("mfaEnrollmentId")
+
+    print(f"  Firebase 2FA required (phone: {phone})")
+    print("  Sending verification code...")
+
+    status, start_result = firebase_mfa_start(mfa_pending, enrollment_id)
+    if start_result.get("error"):
+        print(f"  Failed: {start_result['error'].get('message', 'Unknown')}")
+        return None
+
+    session_info = start_result.get("phoneResponseInfo", {}).get("sessionInfo")
+    if not session_info:
+        print(f"  No session info returned: {json.dumps(start_result, indent=2)}")
+        return None
+
+    print("  Code sent!")
+    code = input("Enter the 6-digit Firebase verification code: ").strip()
+    if not code:
+        return None
+
+    status, final_result = firebase_mfa_finalize(mfa_pending, session_info, code)
+    if final_result.get("error"):
+        print(f"  Verification failed: {final_result['error'].get('message', 'Unknown')}")
+        return None
+
+    id_token = final_result.get("idToken")
+    refresh_token = final_result.get("refreshToken")
+    if not id_token or not refresh_token:
+        print(f"  Unexpected response: {json.dumps(final_result, indent=2)}")
+        return None
+
+    print("  Firebase 2FA verified!")
+    return {
+        "firebase_token": id_token,
+        "refresh_token": refresh_token,
+        "captured_at": datetime.now().isoformat(),
+    }
+
+
+def _pm_authenticate(auth):
+    """Login to PlayMetrics backend and handle PlayMetrics 2FA if needed."""
+    verified2fa = auth.get("verified2fa", "")
+
+    print("Logging in to PlayMetrics backend...")
+    status, result = pm_login(auth["firebase_token"], verified2fa)
+
+    if status != 200:
+        print(f"  PlayMetrics login failed ({status}): {json.dumps(result, indent=2)[:300]}")
+        return None
+
+    # Check if PlayMetrics needs its own 2FA
+    if result.get("needs_2fa"):
+        print("\nPlayMetrics 2FA verification required!")
+        print("Sending verification code to your phone...")
+
+        status, send_result = pm_2fa_send_code(auth["firebase_token"])
+        if status != 200:
+            print(f"  Failed to send code ({status}): {json.dumps(send_result, indent=2)[:300]}")
+            return None
+
+        # send_result contains a token needed for validation
+        tfa_token = send_result.get("token", "")
+        if not tfa_token:
+            print(f"  No token in send_code response: {json.dumps(send_result, indent=2)[:300]}")
+            return None
+
+        print("Code sent!")
+        code = input("Enter the 6-digit verification code: ").strip()
+        if not code:
+            print("No code entered.")
+            return None
+
+        status, validate_result = pm_2fa_validate(
+            auth["firebase_token"], tfa_token, code, remember_device=True
+        )
+        if status != 200:
+            print(f"  Validation failed ({status}): {json.dumps(validate_result, indent=2)[:300]}")
+            return None
+
+        # Extract access_key and verified2fa from the validation response
+        access_key = validate_result.get("access_key", "")
+        new_verified2fa = validate_result.get("verified2fa", "")
+
+        if not access_key:
+            # access_key might be nested in user data
+            user = validate_result.get("user", validate_result)
+            access_key = user.get("access_key", "")
+
+        if access_key:
+            auth["pm_access_key"] = access_key
+            auth["verified2fa"] = new_verified2fa
+            print("2FA verified! Access key obtained.")
+        else:
+            print(f"  No access_key in response: {json.dumps(validate_result, indent=2)[:500]}")
+            return None
+    else:
+        # No 2FA needed — extract access_key from login response
+        access_key = result.get("access_key", "")
+        if not access_key:
+            user = result.get("user", result)
+            access_key = user.get("access_key", "")
+
+        if access_key:
+            auth["pm_access_key"] = access_key
+            print("  Access key obtained (no 2FA needed)")
+        else:
+            print(f"  No access_key in login response. Keys: {list(result.keys())}")
+            print(f"  Response: {json.dumps(result, indent=2)[:500]}")
+            return None
+
+    # Verify it works
+    if test_api(auth):
+        print("PlayMetrics API access confirmed!")
+    else:
+        print("WARNING: API test still failing after obtaining access_key")
+
+    return auth
+
+
+# =============================================================================
+# Direct API Client
+# =============================================================================
+
+def build_headers(auth):
+    """Build API request headers from auth data."""
+    headers = {
+        "firebase-token": auth.get("firebase_token", ""),
+        "build-version": auth.get("build_version", BUILD_VERSION),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+        "Origin": "https://playmetrics.com",
+        "Referer": "https://playmetrics.com/",
+    }
+    if auth.get("pm_access_key"):
+        headers["pm-access-key"] = auth["pm_access_key"]
+    return headers
+
+
+def test_api(auth):
+    """Quick test to verify auth tokens work."""
+    try:
+        resp = http_client.get(
+            "https://api.playmetrics.com/teams",
+            params={"populate": "num_players"},
+            headers=build_headers(auth),
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            print(f"  API test returned {resp.status_code}: {resp.text[:200]}")
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"  API test error: {e}")
+        return False
+
+
+def api_get(endpoint, params, auth):
+    """Make a GET request to the PlayMetrics API."""
+    url = f"https://api.playmetrics.com{endpoint}"
+    resp = http_client.get(url, params=params, headers=build_headers(auth), timeout=30)
+    if resp.status_code != 200:
+        print(f"    Response {resp.status_code}: {resp.text[:300]}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_all_data(auth):
+    """Fetch all data via direct API calls."""
+    data = {}
+
+    # Players
+    print("Fetching players...")
+    try:
+        data["players"] = api_get("/players", {
+            "data": json.dumps({"include_archived": False}),
+            "populate": "team_players,users,program_ids",
+        }, auth)
+        count = len(data["players"]) if isinstance(data["players"], list) else len(data["players"].get("data", []))
+        print(f"  Got {count} players")
+    except Exception as e:
+        print(f"  Failed: {e}")
+
+    # Teams
+    print("Fetching teams...")
+    try:
+        data["teams"] = api_get("/teams", {"populate": "num_players"}, auth)
+        count = len(data["teams"]) if isinstance(data["teams"], list) else "?"
+        print(f"  Got teams data ({count})")
+    except Exception as e:
+        print(f"  Failed: {e}")
+
+    # Programs
+    print("Fetching programs...")
+    try:
+        data["programs"] = api_get("/program_admin/programs", {"populate": "prune"}, auth)
+        print(f"  Got programs data")
+    except Exception as e:
+        print(f"  Failed: {e}")
+
+    # Tournaments - try common endpoints
+    print("Fetching tournaments...")
+    for endpoint in ["/tournaments", "/events", "/program_admin/events", "/program_admin/tournaments"]:
+        try:
+            result = api_get(endpoint, {}, auth)
+            data["tournaments"] = result
+            print(f"  Got tournaments (via {endpoint})")
+            break
+        except:
+            pass
+    if "tournaments" not in data:
+        print("  No tournament endpoint found (tried /tournaments, /events, etc.)")
+
+    # Games - try common endpoints
+    print("Fetching games...")
+    for endpoint in ["/games", "/matches", "/schedule", "/program_admin/games", "/program_admin/schedule"]:
+        try:
+            result = api_get(endpoint, {}, auth)
+            data["games"] = result
+            print(f"  Got games (via {endpoint})")
+            break
+        except:
+            pass
+    if "games" not in data:
+        print("  No games endpoint found (tried /games, /matches, etc.)")
 
     return data
 
@@ -498,7 +532,6 @@ def fetch_all_data_via_browser(driver):
 # =============================================================================
 
 def build_team_lookup(teams_data):
-    """Build a lookup dict of team_id -> team_name"""
     lookup = {}
     if not teams_data:
         return lookup
@@ -512,7 +545,6 @@ def build_team_lookup(teams_data):
 
 
 def build_program_lookup(programs_data):
-    """Build a lookup dict of program_id -> program_name"""
     lookup = {}
     if not programs_data:
         return lookup
@@ -526,7 +558,6 @@ def build_program_lookup(programs_data):
 
 
 def extract_player_data(player, team_lookup, program_lookup):
-    """Extract relevant fields from a player record"""
     player_id = player.get("id") or player.get("player_id", "")
     first_name = player.get("first_name") or player.get("firstName") or player.get("fname", "")
     last_name = player.get("last_name") or player.get("lastName") or player.get("lname", "")
@@ -540,7 +571,6 @@ def extract_player_data(player, team_lookup, program_lookup):
     birth_date = player.get("birth_date") or player.get("birthDate") or player.get("dob", "")
     gender = player.get("gender") or player.get("sex", "")
 
-    # Team info
     team_names = []
     team_players = player.get("team_players") or player.get("teams") or []
     if isinstance(team_players, list):
@@ -551,7 +581,6 @@ def extract_player_data(player, team_lookup, program_lookup):
             elif tp.get("team_name") or tp.get("name"):
                 team_names.append(tp.get("team_name") or tp.get("name"))
 
-    # Program info
     program_names = []
     program_ids = player.get("program_ids") or player.get("programs") or []
     if isinstance(program_ids, list):
@@ -561,31 +590,23 @@ def extract_player_data(player, team_lookup, program_lookup):
             if pid and pid in program_lookup:
                 program_names.append(program_lookup[pid])
 
-    # Contact info from users (parents/guardians)
     contacts = []
     users = player.get("users") or player.get("contacts") or player.get("guardians") or []
     if isinstance(users, list):
         for user in users:
             contact = {
-                "name": "",
-                "email": "",
-                "phone": "",
-                "relationship": ""
+                "name": (
+                    user.get("name") or
+                    f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or
+                    f"{user.get('firstName', '')} {user.get('lastName', '')}".strip()
+                ),
+                "email": user.get("email") or user.get("email_address", ""),
+                "phone": (
+                    user.get("phone") or user.get("phone_number") or
+                    user.get("mobile") or user.get("cell", "")
+                ),
+                "relationship": user.get("relationship") or user.get("role") or user.get("type", ""),
             }
-            contact["name"] = (
-                user.get("name") or
-                f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or
-                f"{user.get('firstName', '')} {user.get('lastName', '')}".strip()
-            )
-            contact["email"] = user.get("email") or user.get("email_address", "")
-            contact["phone"] = (
-                user.get("phone") or
-                user.get("phone_number") or
-                user.get("mobile") or
-                user.get("cell", "")
-            )
-            contact["relationship"] = user.get("relationship") or user.get("role") or user.get("type", "")
-
             if contact["name"] or contact["email"] or contact["phone"]:
                 contacts.append(contact)
 
@@ -605,37 +626,35 @@ def extract_player_data(player, team_lookup, program_lookup):
 # CSV Export
 # =============================================================================
 
-def export_to_csv(players_data, team_lookup, program_lookup, filename=None, max_contacts=4):
-    """Export player data to CSV with all contacts on one row"""
-    if filename is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = SCRIPT_DIR / f"playmetrics_players_{timestamp}.csv"
+def export_players_csv(players_data, team_lookup, program_lookup, max_contacts=4):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = SCRIPT_DIR / f"playmetrics_players_{timestamp}.csv"
 
     rows = []
     players = players_data if isinstance(players_data, list) else players_data.get("data", players_data.get("players", []))
 
     for player in players:
-        player_info = extract_player_data(player, team_lookup, program_lookup)
-
+        info = extract_player_data(player, team_lookup, program_lookup)
         row = {
-            "Player ID": player_info["player_id"],
-            "Player First Name": player_info["first_name"],
-            "Player Last Name": player_info["last_name"],
-            "Birth Date": player_info["birth_date"],
-            "Gender": player_info["gender"],
-            "Program(s)": player_info["programs"],
+            "Player ID": info["player_id"],
+            "First Name": info["first_name"],
+            "Last Name": info["last_name"],
+            "Birth Date": info["birth_date"],
+            "Gender": info["gender"],
+            "Teams": info["teams"],
+            "Program(s)": info["programs"],
         }
-
-        contacts = player_info["contacts"] or []
+        contacts = info["contacts"] or []
         for i in range(max_contacts):
-            contact_num = i + 1
+            n = i + 1
             if i < len(contacts):
-                row[f"Parent {contact_num} Name"] = contacts[i]["name"]
-                row[f"Parent {contact_num} Email"] = contacts[i]["email"]
+                row[f"Parent {n} Name"] = contacts[i]["name"]
+                row[f"Parent {n} Email"] = contacts[i]["email"]
+                row[f"Parent {n} Phone"] = contacts[i]["phone"]
             else:
-                row[f"Parent {contact_num} Name"] = ""
-                row[f"Parent {contact_num} Email"] = ""
-
+                row[f"Parent {n} Name"] = ""
+                row[f"Parent {n} Email"] = ""
+                row[f"Parent {n} Phone"] = ""
         rows.append(row)
 
     if rows:
@@ -644,10 +663,39 @@ def export_to_csv(players_data, team_lookup, program_lookup, filename=None, max_
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
-        print(f"\nExported {len(rows)} players to {filename}")
+        print(f"  Exported {len(rows)} players -> {filename}")
     else:
-        print("No player data to export!")
+        print("  No player data to export!")
+    return filename
 
+
+def export_generic_csv(data, name):
+    if not data:
+        return None
+    items = data if isinstance(data, list) else data.get("data", data.get(name, []))
+    if not items or not isinstance(items, list):
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = SCRIPT_DIR / f"playmetrics_{name}_{timestamp}.csv"
+
+    rows = []
+    for item in items:
+        row = {}
+        for key, value in item.items():
+            if isinstance(value, (dict, list)):
+                row[key] = json.dumps(value)
+            else:
+                row[key] = value
+        rows.append(row)
+
+    if rows:
+        fieldnames = list(dict.fromkeys(k for row in rows for k in row))
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"  Exported {len(rows)} {name} -> {filename}")
     return filename
 
 
@@ -656,71 +704,46 @@ def export_to_csv(players_data, team_lookup, program_lookup, filename=None, max_
 # =============================================================================
 
 def main():
-    print("PlayMetrics Player Export")
+    print("PlayMetrics Data Export")
     print("=" * 40)
 
     if not CREDENTIALS["password"]:
         print("\nERROR: Please set your password!")
-        print("\nOption 1: Create a .env file in the same directory:")
+        print("Create a .env file:")
         print("  PLAYMETRICS_EMAIL=your_email@example.com")
         print("  PLAYMETRICS_PASSWORD=your_password")
-        print("\nOption 2: Set environment variables:")
-        print("  set PLAYMETRICS_PASSWORD=your_password  (Windows)")
-        print("  export PLAYMETRICS_PASSWORD=your_password  (Mac/Linux)")
         return
 
-    driver = None
-    try:
-        # Import selenium here to give better error message if missing
-        try:
-            from selenium import webdriver
-        except ImportError:
-            print("\nMissing dependencies! Install with:")
-            print("  pip install selenium webdriver-manager")
-            return
+    # Authenticate (refresh token or full login with 2FA prompt)
+    auth = get_valid_auth()
+    if not auth:
+        print("\nAuthentication failed.")
+        return
 
-        print("\nLaunching browser...")
-        driver = create_driver()
+    # Fetch all data via direct API calls
+    print("\nFetching data from PlayMetrics API...")
+    data = fetch_all_data(auth)
 
-        # Login to PlayMetrics
-        login_to_playmetrics(driver)
+    if not data.get("players"):
+        print("\nERROR: Could not fetch player data.")
+        print(f"Try deleting auth file to force re-login: del \"{AUTH_FILE}\"")
+        return
 
-        # Fetch all data through the browser
-        print("\nFetching data from PlayMetrics...")
-        data = fetch_all_data_via_browser(driver)
+    # Build lookups
+    team_lookup = build_team_lookup(data.get("teams"))
+    program_lookup = build_program_lookup(data.get("programs"))
+    print(f"\n{len(team_lookup)} teams, {len(program_lookup)} programs")
 
-        if not data.get('players'):
-            print("\nERROR: Could not fetch player data")
-            print("The app may have changed. Try running with visible browser for debugging.")
-            return
+    # Export
+    print("\nExporting...")
+    export_players_csv(data["players"], team_lookup, program_lookup)
 
-        # Build lookups
-        team_lookup = build_team_lookup(data.get('teams'))
-        program_lookup = build_program_lookup(data.get('programs'))
+    if data.get("tournaments"):
+        export_generic_csv(data["tournaments"], "tournaments")
+    if data.get("games"):
+        export_generic_csv(data["games"], "games")
 
-        print(f"Found {len(team_lookup)} teams")
-        print(f"Found {len(program_lookup)} programs")
-
-        # Export to CSV
-        export_to_csv(data['players'], team_lookup, program_lookup)
-
-    except Exception as e:
-        print(f"\nError: {e}")
-        import traceback
-        traceback.print_exc()
-
-        # Save screenshot for debugging
-        if driver:
-            try:
-                screenshot_path = SCRIPT_DIR / "error_screenshot.png"
-                driver.save_screenshot(str(screenshot_path))
-                print(f"Screenshot saved to: {screenshot_path}")
-            except:
-                pass
-
-    finally:
-        if driver:
-            driver.quit()
+    print("\nDone!")
 
 
 if __name__ == "__main__":
