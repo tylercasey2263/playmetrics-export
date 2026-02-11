@@ -637,8 +637,7 @@ def extract_player_data(player, team_lookup, program_lookup):
 # =============================================================================
 
 def export_players_csv(players_data, team_lookup, program_lookup, max_contacts=4):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = SCRIPT_DIR / f"playmetrics_players_{timestamp}.csv"
+    filename = SCRIPT_DIR / "playmetrics_players.csv"
 
     rows = []
     players = players_data if isinstance(players_data, list) else players_data.get("data", players_data.get("players", []))
@@ -686,8 +685,7 @@ def export_generic_csv(data, name):
     if not items or not isinstance(items, list):
         return None
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = SCRIPT_DIR / f"playmetrics_{name}_{timestamp}.csv"
+    filename = SCRIPT_DIR / f"playmetrics_{name}.csv"
 
     rows = []
     for item in items:
