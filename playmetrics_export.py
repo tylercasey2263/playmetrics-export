@@ -9,10 +9,12 @@ Authentication is handled entirely via Firebase REST API:
 - Subsequent runs: refreshes the saved token automatically (no 2FA needed)
 
 Usage:
-    python playmetrics_export.py                  # Export all data types
-    python playmetrics_export.py --players        # Export only players
-    python playmetrics_export.py --teams --games  # Export teams and games
-    python playmetrics_export.py -p -t            # Short flags work too
+    python playmetrics_export.py                                    # Export all data types
+    python playmetrics_export.py --players                          # Export only players
+    python playmetrics_export.py --teams --games                    # Export teams and games
+    python playmetrics_export.py -p -t                              # Short flags work too
+    python playmetrics_export.py --filter-program "My Program"      # Players in a program
+    python playmetrics_export.py --filter-program "A" --filter-program "B"  # Multiple programs
 """
 
 import argparse
@@ -636,14 +638,23 @@ def extract_player_data(player, team_lookup, program_lookup):
 # CSV Export
 # =============================================================================
 
-def export_players_csv(players_data, team_lookup, program_lookup, max_contacts=4):
+def export_players_csv(players_data, team_lookup, program_lookup, max_contacts=4, program_filter=None):
     filename = SCRIPT_DIR / "playmetrics_players.csv"
 
     rows = []
     players = players_data if isinstance(players_data, list) else players_data.get("data", players_data.get("players", []))
 
+    # Normalize filter names for case-insensitive comparison
+    filter_names = [n.lower() for n in program_filter] if program_filter else None
+
     for player in players:
         info = extract_player_data(player, team_lookup, program_lookup)
+
+        if filter_names:
+            player_programs = [p.lower() for p in info["programs"].split("; ") if p]
+            if not any(f in p for f in filter_names for p in player_programs):
+                continue
+
         row = {
             "Player ID": info["player_id"],
             "First Name": info["first_name"],
@@ -722,6 +733,13 @@ def parse_args():
     parser.add_argument("-r", "--programs", action="store_true", help="Export programs")
     parser.add_argument("-n", "--tournaments", action="store_true", help="Export tournaments")
     parser.add_argument("-g", "--games", action="store_true", help="Export games")
+    parser.add_argument(
+        "--filter-program",
+        dest="filter_program",
+        action="append",
+        metavar="PROGRAM",
+        help="Filter player export to only players in this program (can be specified multiple times)",
+    )
     return parser.parse_args()
 
 
@@ -736,12 +754,17 @@ def main():
     for name in ALL_TYPES:
         if getattr(args, name, False):
             requested.add(name)
-    if not requested:
+    # --filter-program implies players export
+    if args.filter_program and not requested:
+        requested.add("players")
+    elif not requested:
         requested = ALL_TYPES.copy()
 
     print("PlayMetrics Data Export")
     print("=" * 40)
     print(f"Exporting: {', '.join(sorted(requested))}")
+    if args.filter_program:
+        print(f"Program filter: {', '.join(args.filter_program)}")
 
     if not CREDENTIALS["password"]:
         print("\nERROR: Please set your password!")
@@ -769,7 +792,7 @@ def main():
     exported = 0
 
     if "players" in requested and data.get("players"):
-        export_players_csv(data["players"], team_lookup, program_lookup)
+        export_players_csv(data["players"], team_lookup, program_lookup, program_filter=args.filter_program)
         exported += 1
 
     if "teams" in requested and data.get("teams"):
